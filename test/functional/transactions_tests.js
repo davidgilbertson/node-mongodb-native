@@ -16,14 +16,16 @@ chai.config.showDiff = true;
 chai.config.truncateThreshold = 0;
 
 const testContext = {
-  dbName: 'transactions-tests',
+  dbName: 'transaction-tests',
   collectionName: 'test'
 };
 
 describe('Transactions (spec)', function() {
   const testSuites = fs
     .readdirSync(`${__dirname}/spec/transactions`)
-    .filter(x => x.indexOf('.json') !== -1)
+    .filter(x => {
+      return x.indexOf('insert.json') === 0;
+    })
     .map(x =>
       Object.assign(JSON.parse(fs.readFileSync(`${__dirname}/spec/transactions/${x}`)), {
         name: path.basename(x, '.json')
@@ -76,17 +78,27 @@ describe('Transactions (spec)', function() {
           metadata: { requires: { topology: 'replicaset' } },
           test: function() {
             const commandEvents = [];
-
             return MongoClient.connect(testContext.url, { enableCommandMonitoring: true }).then(
               client => {
                 testContext.testClient = client;
                 client.on('commandStarted', event => {
+                  console.dir(event, { depth: null });
                   if (event.databaseName === testContext.dbName) commandEvents.push(event);
                 });
 
                 const transactionOptions = Object.assign({}, testData.transactionOptions);
                 const session0 = client.startSession(transactionOptions);
                 const session1 = client.startSession(transactionOptions);
+
+                console.log('EXPECTED:');
+                console.dir(
+                  normalizeCommandShapes(
+                    testData.expectations.map(x =>
+                      linkSessionData(x.command_started_event, { session0, session1 })
+                    )
+                  ),
+                  { depth: null }
+                );
 
                 return testOperations(client, testData, { session0, session1 })
                   .catch(err => {
@@ -105,30 +117,36 @@ describe('Transactions (spec)', function() {
                       Array.isArray(testData.expectations) &&
                       testData.expectations.length > 0
                     ) {
-                      const actualCommands = normalizeCommandShapes(commandEvents).map(
-                        c => c.command
-                      );
-                      const expectedCommands = normalizeCommandShapes(
+                      const actualEvents = normalizeCommandShapes(commandEvents);
+                      const expectedEvents = normalizeCommandShapes(
                         testData.expectations.map(x =>
                           linkSessionData(x.command_started_event, { session0, session1 })
                         )
-                      ).map(c => c.command);
+                      );
 
                       // NOTE: obviously broken now
                       // expect(actualCommands).to.have.length(expectations.length);
 
-                      expectedCommands.forEach((expected, idx) => {
-                        const actual = actualCommands[idx];
+                      expectedEvents.forEach((expected, idx) => {
+                        const actual = actualEvents[idx];
                         // NOTE: get rid of this when they match up
                         if (actual == null) return;
 
-                        const omitKeys = Object.keys(expected).reduce((lhs, rhs) => {
-                          if (expected[rhs] === null) lhs.push(rhs);
+                        expect(actual.commandName).to.equal(expected.commandName);
+                        expect(actual.databaseName).to.equal(expected.databaseName);
+
+                        const actualCommand = actual.command;
+                        const expectedCommand = expected.command;
+                        const omitKeys = Object.keys(expectedCommand).reduce((lhs, rhs) => {
+                          if (expectedCommand[rhs] === null) {
+                            lhs.push(rhs);
+                            delete expectedCommand[rhs];
+                          }
                           return lhs;
                         }, []);
 
-                        expect(actual).to.not.contain.any.keys(omitKeys);
-                        expect(actual).to.deep.include(expected);
+                        expect(actualCommand).to.not.contain.any.keys(omitKeys);
+                        expect(actualCommand).to.deep.include(expectedCommand);
                       });
                     }
 
@@ -165,8 +183,8 @@ function normalizeCommandShapes(commands) {
     JSON.parse(
       EJSON.stringify({
         command: command.command,
-        commandName: command.commandName,
-        databaseName: command.databaseName
+        commandName: command.command_name ? command.command_name : command.commandName,
+        databaseName: command.database_name ? command.database_name : command.databaseName
       })
     )
   );
@@ -187,6 +205,7 @@ function testOperation(operation, coll, context) {
       if (key === 'filter') return args.unshift(operation.arguments.filter);
       if (key === 'update' || key === 'replacement') return args.push(operation.arguments[key]);
       if (key === 'document') return args.unshift(operation.arguments.document);
+      if (key === 'documents') return args.unshift(operation.arguments.documents);
       if (key === 'session') {
         opOptions.session = context[operation.arguments.session];
         return;
@@ -196,6 +215,8 @@ function testOperation(operation, coll, context) {
     });
   }
   args.push(opOptions);
+
+  console.dir(args);
 
   let opPromise = coll[operation.name].apply(coll, args);
   if (operation.result) {
